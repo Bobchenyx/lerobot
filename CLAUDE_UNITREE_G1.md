@@ -112,6 +112,88 @@ Joystick mapping: `lx->lateral (negated)`, `ly->forward`, `rx->rotation (negated
 - Without controller: `{joint_name}.q` x 29
 - With controller: `{arm_joint}.q` x 14 + `remote.lx/ly/rx/ry` x 4
 
+## Dataset Format
+
+The G1 data format is not documented in a standalone spec — it is derived at runtime from the robot's `observation_features` and `action_features` properties. The conversion chain is:
+
+```
+g1_utils.py: G1_29_JointIndex (enum, 29 joint names)
+    ↓
+unitree_g1.py: observation_features / action_features
+    → {joint.name + ".q": float} per joint, plus {cam_name: (H, W, 3)} per camera
+    ↓
+datasets/utils.py: hw_to_dataset_features()
+    → collapses all float features into a single vector column
+    → observation floats → "observation.state" shape (29,)
+    → action floats → "action" shape (29,) or (18,)
+    → camera tuples → "observation.images.{cam_name}" dtype "video"
+    ↓
+datasets/utils.py: DEFAULT_FEATURES
+    → adds timestamp, frame_index, episode_index, index, task_index
+    ↓
+LeRobotDataset.add_frame() → build_dataset_frame()
+    → packs scalar values into numpy arrays ordered by ft["names"]
+    → writes Parquet (snappy) + encodes camera frames to .mp4
+```
+
+Key source locations:
+- `robots/unitree_g1/g1_utils.py:81-118` — `G1_29_JointIndex` enum (joint names)
+- `robots/unitree_g1/unitree_g1.py:229-240` — `observation_features`, `action_features`
+- `datasets/utils.py:615-664` — `hw_to_dataset_features()` (float collapse + camera mapping)
+- `datasets/utils.py:667-691` — `build_dataset_frame()` (dict → numpy packing)
+- `datasets/utils.py:73-79` — `DEFAULT_FEATURES` (metadata columns)
+- `datasets/lerobot_dataset.py:606-664` — `LeRobotDataset` docstring (directory layout)
+- `scripts/lerobot_record.py:451-464` — feature aggregation during recording
+
+### Parquet Schema
+
+| Column | Dtype | Shape | Content |
+|--------|-------|-------|---------|
+| `observation.state` | float32 | (29,) | 29 joint positions (`.q`), ordered by `G1_29_JointIndex` |
+| `action` | float32 | (29,) or (18,) | 29 joint `.q` (no controller) or 14 arm `.q` + 4 remote axes (with controller) |
+| `timestamp` | float32 | (1,) | Frame timestamp |
+| `frame_index` | int64 | (1,) | Per-episode frame index |
+| `episode_index` | int64 | (1,) | Episode number |
+| `index` | int64 | (1,) | Global frame index |
+| `task_index` | int64 | (1,) | Index into `tasks.parquet` |
+
+Camera images are **not** stored in Parquet — they are encoded as `.mp4` files.
+
+### Dataset Directory Structure
+
+```
+{dataset_root}/
+├── data/
+│   └── chunk-000/
+│       └── file-000.parquet           # frame data (observation.state, action, timestamps, etc.)
+├── meta/
+│   ├── info.json                      # fps, features schema, total_episodes, data/video paths
+│   ├── stats.json                     # per-feature min/max/mean/std
+│   ├── tasks.parquet                  # task_index -> task description string
+│   └── episodes/
+│       └── chunk-000/
+│           └── file-000.parquet       # per-episode metadata (length, chunk/file indices)
+└── videos/
+    └── observation.images.{cam_name}/
+        └── chunk-000/
+            └── file-000.mp4           # video frames for the corresponding episodes
+```
+
+### What Is and Is Not Recorded
+
+Recorded (appears in dataset):
+- Joint positions (`.q`) for all 29 joints
+- Camera images (as MP4 video)
+- Action commands sent to the robot
+
+**Not** recorded in the dataset (collected internally but not in `observation_features`):
+- Joint velocities (`.dq`)
+- Joint torques (`.tau`)
+- IMU data (gyroscope, accelerometer, quaternion, roll/pitch/yaw)
+- Wireless remote raw bytes
+
+To include these additional signals, you would need to modify `observation_features` in `unitree_g1.py` to expose them.
+
 ## Data Collection Workflow
 
 ```bash
